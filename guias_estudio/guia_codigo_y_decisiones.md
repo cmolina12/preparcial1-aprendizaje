@@ -39,34 +39,115 @@ Esto es SOLO el "cómo": checklist, tabla de decisión, y patrones de código. L
 
 ---
 
-## Tabla de decisión por dimensión de calidad
+## Guía de decisión por dimensión — con código pegado a cada situación
 
-| Dimensión | Pregunta | Cómo detectar |
+### Completitud (valores faltantes)
+
+Detectar:
+```python
+df.isnull().sum()
+(df.isnull().sum() / df.shape[0] * 100).round(2).sort_values(ascending=False)
+```
+
+| Situación | Qué hacer | Código |
 |---|---|---|
-| Completitud | ¿faltan datos? | `isnull().sum()`, `% nulos` |
-| Unicidad | ¿duplicados/IDs repetidos? | `duplicated().sum()` |
-| Validez | ¿valores en el dominio esperado? | `.unique()`, tipos |
-| Exactitud | ¿valores física/lógicamente posibles? | `describe()` min/max |
-| Consistencia | ¿misma categoría escrita distinto? | comparar `.unique()` |
+| Nulos <5-10%, numérica | Imputar mediana — **dentro del pipeline**, no aquí manual | Ya está en `numeric_transformer` → `SimpleImputer(strategy='median')` |
+| Nulos <5-10%, categórica | Imputar moda — dentro del pipeline | `SimpleImputer(strategy='most_frequent')` |
+| Nulos >40-50% en una columna | Evaluar eliminar la columna completa | `df = df.drop(columns=['col'])` |
+| Nulos en el **target** | Eliminar esas filas (no se puede entrenar sin etiqueta) | `df = df.dropna(subset=['target'])` |
+| Nulos concentrados en una categoría específica | Imputar por grupo en vez de con la mediana global | `df['num'] = df.groupby('cat')['num'].transform(lambda x: x.fillna(x.median()))` |
+| Falta un ID | Generar uno nuevo que no choque con los existentes | `nuevo_id = df['id'].max()+1; df.loc[df['id'].isna(), 'id'] = nuevo_id` (ver nota abajo si son varios nulos) |
 
-| Situación | Qué hacer |
-|---|---|
-| Nulos <5-10%, numérica | Imputar mediana (dentro del pipeline) |
-| Nulos <5-10%, categórica | Imputar moda (dentro del pipeline) |
-| Nulos >40-50% en una columna | Evaluar eliminar la columna |
-| Nulos en el target | Eliminar filas (`dropna`) |
-| Nulos concentrados en una categoría | Imputar por grupo (`groupby().transform()`) |
-| Fila 100% duplicada | `drop_duplicates()` directo |
-| Mismo ID, datos distintos (conflicto real) | Investigar causa; si no se resuelve: quedarse con la fila más completa, eliminar ambas, o asignar ID nuevo si son personas distintas — justificando la elección |
-| Categoría escrita distinto | Normalizar con `.replace()`/`.map()` |
-| Numérica cargada como texto | `pd.to_numeric(errors='coerce')` |
-| Valor aislado sin patrón (outlier real) | Evaluar IQR/z-score; capear o dejar si el modelo lo tolera |
-| Muchos valores fuera de rango con un patrón | Sospechar error sistemático de unidad — buscar el factor antes de descartar |
-| Valor inválido sin causa recuperable | Convertir a `NaN`, imputar en el pipeline |
+Nota: si necesitas asignar un ID nuevo a **varias** filas nulas a la vez (no solo una), cada una necesita un valor distinto:
+```python
+n_nulos = df['id'].isna().sum()
+nuevos_ids = range(int(df['id'].max())+1, int(df['id'].max())+1+n_nulos)
+df.loc[df['id'].isna(), 'id'] = list(nuevos_ids)
+```
 
-**Regla de oro outliers:** estadísticamente atípico ≠ error. Imposible → corregir/invalidar. Solo inusual pero posible → dejarlo y documentarlo (puede ser un caso real).
+### Unicidad (duplicados)
+
+Detectar:
+```python
+df.duplicated().sum()                     # filas 100% idénticas
+df['id'].duplicated().sum()               # IDs repetidos (puede incluir conflictos, no solo exactos)
+```
+
+| Situación | Qué hacer | Código |
+|---|---|---|
+| Fila 100% idéntica repetida | Eliminar la copia | `df = df.drop_duplicates(subset=[...], keep='first')` |
+| Mismo ID, datos distintos (conflicto real) | Investigar antes de decidir | Ver bloque de investigación abajo |
+
+Investigar un conflicto de ID (mismo ID, filas con datos distintos):
+```python
+repetidos = df[df['id'].duplicated(keep=False)]
+for id_, grupo in repetidos.groupby('id'):
+    print(id_, 'versiones distintas:', grupo.drop(columns='id').drop_duplicates().shape[0])
+    # 1 versión = duplicado exacto normal; >1 = conflicto real, hay que decidir
+```
+
+Si es un conflicto real sin explicación (no se resuelve con una corrección de otro tipo, como pasó con Edad/meses), tres salidas posibles, a elegir con criterio y justificando:
+```python
+# Opción A: quedarte con la fila más completa (menos nulos)
+conflicto = df[df['id'] == id_problema]
+fila_mas_completa = conflicto.loc[conflicto.notna().sum(axis=1).idxmax()]
+
+# Opción B: eliminar ambas versiones (si el conflicto es irresoluble)
+df = df[df['id'] != id_problema]
+
+# Opción C: son personas/registros distintos, solo el ID chocó por error — asignar uno nuevo a una de las dos
+nuevo_id = df['id'].max() + 1
+df.loc[conflicto.index[1], 'id'] = nuevo_id
+```
+
+### Validez / Consistencia (categóricas y tipos)
+
+Detectar:
+```python
+df['col'].unique()
+df['col'].value_counts(dropna=False)
+```
+
+| Situación | Qué hacer | Código |
+|---|---|---|
+| Misma categoría escrita distinto (ej. "M" y "Masculino") | Unificar con un mapeo | `df['col'] = df['col'].replace({'M': 'Masculino', 'F': 'Femenino'})` |
+| Numérica cargada como texto | Forzar conversión, lo inválido se vuelve NaN | `df['col'] = pd.to_numeric(df['col'], errors='coerce')` |
+| Categórica con muy pocas observaciones (posible typo) | Revisar caso por caso si es válida o un error | inspeccionar con `df[df['col'] == 'valor_raro']` antes de decidir |
+
+### Exactitud (valores imposibles/fuera de rango)
+
+Detectar:
+```python
+df['col'].describe()   # revisar min/max contra lo físicamente posible
+```
+
+| Situación | Cómo diferenciarla | Qué hacer | Código |
+|---|---|---|---|
+| Valor aislado, sin patrón (outlier real, posiblemente legítimo) | Pocos casos, sin relación entre sí | Evaluar con IQR; dejar si es plausible, o capear si distorsiona mucho el modelo | `Q1, Q3 = df['col'].quantile([.25,.75]); IQR = Q3-Q1` luego filtrar con esos límites |
+| Muchos valores fuera de rango con un patrón (ej. múltiplos de algo) | Revisar percentiles — salto brusco, muchos casos iguales | Sospechar error sistemático de unidad — corregir con una operación, no borrar | `df.loc[condición, 'col'] = df.loc[condición, 'col'] / factor` |
+| Valor claramente inválido, sin causa recuperable (ej. negativo donde no puede serlo) | Pocos casos, sin fórmula que los explique | Tratar como inválido, no inventar un valor | `df.loc[condición, 'col'] = np.nan` (se imputa después en el pipeline) |
+
+**Regla de oro outliers:** estadísticamente atípico ≠ error. Imposible → corregir/invalidar. Solo inusual pero posible → dejarlo y documentarlo (puede ser un caso real, ej. un atleta excepcional).
 
 **Algoritmo mental:** EDA general → por cada hallazgo raro, ¿aislado o sistemático? → si sistemático, buscar causa (unidad, formato) antes de borrar → si aislado sin causa, `NaN` y documentar → imputación estadística siempre dentro del pipeline (nunca sobre el dataset completo antes del split, es fuga de información).
+
+### Eliminar filas o registros — referencia rápida
+
+```python
+# Por condición directa
+df = df[df['col'] >= 0]                 # te quedas con lo que cumple
+df = df[~(df['col'] < 0)]               # eliminas lo que cumple (negando con ~)
+
+# Varias condiciones (cada una entre paréntesis, & = y, | = o)
+df = df[~((df['col'] < 15) | (df['col'] > 60))]
+
+# Por índice, cuando ya identificaste las filas problemáticas aparte
+indices_malos = df[df['col'] < 0].index
+df = df.drop(index=indices_malos)
+
+# Filas con nulo en una columna específica (target, ID)
+df = df.dropna(subset=['col'])
+```
 
 ---
 
@@ -140,6 +221,40 @@ df = df.drop(index=df[condición].index)          # alternativa usando índices
 
 ---
 
+## Veredicto sobre los códigos de la plantilla oficial del examen
+
+La plantilla que da la universidad trae mucho código de referencia, pero no todo vale la pena usarlo tal cual. Clasificación después de haber pasado por todo:
+
+### Usar siempre (memorizar, aplica a cualquier caso)
+- Imports básicos (pandas, numpy, sklearn, matplotlib, seaborn) — quitar SMOTE/RandomUnderSampler si el caso es regresión
+- `pd.read_csv`, `df.copy()`
+- `df.shape`, `df.info()`, `df.describe(include='all')` / `describe(include='object')`
+- `df.isnull().sum()` (con `isna()` es un alias exacto, no hace falta usar los dos)
+- `df.duplicated().sum()`, `.unique()`/`.nunique()`, `value_counts()`
+- Filtrado condicional (`df[condición]`, `~condición`, `&`/`|`)
+- `.replace()`, `.map()`, `.loc[condición, col] = valor`
+- `np.where(...)` para columnas condicionales
+- `drop_duplicates(subset=[...], keep=...)`
+- Patrón `groupby('id').size()` para detectar IDs repetidos con conteo (el que usamos para el conflicto de `log_id`)
+- `train_test_split`
+- El bloque final de `ColumnTransformer` + `Pipeline` — esqueleto del punto 4
+
+### Situacional (solo si el caso nuevo lo pide)
+- `pd.to_datetime` + `sort_values` — solo si hay columna de fecha
+- `pd.crosstab` — cruzar dos categóricas, no siempre necesario
+- Crear columnas nuevas (`df['nueva'] = ...`) — solo si hay feature engineering real que justificar
+- SMOTE/RandomUnderSampler — solo si es clasificación con clases desbalanceadas; en regresión no aplica
+- `pairplot`/heatmap con muchas variables — útil pero puede saturarse, usar selectivamente
+
+### Evitar o usar con cuidado
+- `df.fillna(df['col2'].median(), inplace=True)` — bug: rellena TODO el DataFrame con la mediana de esa columna. Corregir a `df['col2'] = df['col2'].fillna(df['col2'].median())`.
+- Bloque de eliminación de outliers por IQR que borra filas automáticamente para TODAS las numéricas — peligroso sin pensar, borra outliers reales junto con errores. Aplicar columna por columna, con justificación explícita de que ES un error.
+- Ejemplos con columnas del dataset de vivienda (`Calificación`, `AreaHabitable`, `Cuartos`, `Baños`, `FrenteMar`) — solo sirven como referencia de sintaxis, hay que reescribirlos con las columnas del caso real.
+- Imputación por razón entre columnas (`k = data['Calificación']/data['AreaHabitable']`) — muy específico del ejemplo de vivienda; la idea (imputar usando una relación conocida entre dos columnas) puede servir si el caso nuevo tiene algo similar, pero el código no es copiable tal cual.
+- Bloques de gráficos que se repiten con ligeras variaciones — quedarse con una sola versión.
+
+---
+
 ## Pipeline (punto 4, 20%)
 
 ```python
@@ -195,6 +310,64 @@ display(X_test_prep_df.head())
 ```
 
 `handle_unknown='ignore'` evita que truene si en test aparece una categoría que no vio en train.
+
+⚠️ **Verificación obligatoria después de armar los grupos de columnas:** `ColumnTransformer` descarta en silencio (sin error) cualquier columna que no asignes a ningún transformer. Antes de dar por bueno el pipeline, siempre correr:
+```python
+assert len(numeric_cols) + len(ordinal_cols) + len(nominal_cols) == X_train.shape[1]
+```
+Si no coincide, te falta clasificar alguna columna (nos pasó con `Frecuencia de competencia` en el caso de OlimpiAlpes — se quedó fuera de `numeric_cols` y se perdía silenciosamente).
+
+---
+
+## Si el caso es clasificación en vez de regresión (ej. regresión logística o KNN)
+
+La mayoría del trabajo NO cambia. Esto es lo que sí cambia:
+
+### No cambia
+- EDA y calidad de datos (punto 2): completitud, unicidad, validez, exactitud se detectan y corrigen exactamente igual.
+- Encoders (`OrdinalEncoder`/`OneHotEncoder`): codificar categóricas no depende del algoritmo, depende de la variable.
+- Imputación (mediana/moda dentro del pipeline, fit solo en train).
+- Estructura del `ColumnTransformer` — mismo esqueleto.
+
+### Sí cambia
+
+**1b — Enfoque analítico:** target categórico (binario/multiclase) en vez de continuo → tarea = clasificación.
+- Regresión logística: interpretable (coeficientes = log-odds), buena opción si se pide interpretabilidad.
+- KNN: **no da coeficientes ni reglas interpretables** — si el caso exige interpretabilidad, es más difícil de justificar que logística o un árbol.
+
+**Punto 2 — ahora sí aplica el balance de clases:**
+```python
+data[target].value_counts()
+data[target].value_counts(normalize=True) * 100
+```
+Si está desbalanceado (ej. 90%/10%), es un hallazgo que hay que mencionar y justificar cómo se maneja.
+
+**Punto 2 — relación con el target cambia de forma:**
+- Antes (regresión): scatter numérica vs target continuo.
+- Ahora (clasificación): boxplot de cada numérica **agrupada por clase del target** (mismo tipo de gráfico que usábamos para categóricas vs target, pero ahora el agrupador es el target):
+```python
+sns.boxplot(data=data, x=target, y='numerica')
+```
+- Categórica vs target categórico → `pd.crosstab(data['categorica'], data[target])` en vez de boxplot.
+
+**Punto 3 — el escalado se vuelve más crítico con KNN:**
+- Logística: sensible a escala (igual que regresión lineal) → `StandardScaler` sigue siendo necesario.
+- KNN es **aún más sensible** — calcula distancias directas entre puntos; una variable con rango 0-7000 domina la distancia frente a una de rango 0-1 si no se escala. Con KNN, escalar no es opcional.
+- Si hay desbalance de clases, aquí se justifica SMOTE/undersampling como parte de las transformaciones.
+
+**Punto 4 — Pipeline:**
+- Construcción del `ColumnTransformer` idéntica.
+- Si se incluye balanceo de clases (SMOTE), no se puede meter dentro de un `sklearn.pipeline.Pipeline` normal — usar `imblearn.pipeline.Pipeline` en su lugar, para que SMOTE encadene bien con los demás pasos:
+```python
+from imblearn.pipeline import Pipeline as ImbPipeline
+from imblearn.over_sampling import SMOTE
+
+pipeline_completo = ImbPipeline([
+    ('preprocessor', preprocessor),
+    ('smote', SMOTE(random_state=42)),
+    # ('modelo', LogisticRegression())  # si el punto pidiera entrenar el modelo
+])
+```
 
 ---
 
