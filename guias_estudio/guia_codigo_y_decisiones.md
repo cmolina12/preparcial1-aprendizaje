@@ -317,6 +317,71 @@ assert len(numeric_cols) + len(ordinal_cols) + len(nominal_cols) == X_train.shap
 ```
 Si no coincide, te falta clasificar alguna columna (nos pasó con `Frecuencia de competencia` en el caso de OlimpiAlpes — se quedó fuera de `numeric_cols` y se perdía silenciosamente).
 
+### El mismo pipeline, anotado — qué cambia si es clasificación/KNN
+
+Mismo código de arriba, con comentarios marcando exactamente los 2 puntos que cambian (todo lo demás es idéntico):
+
+```python
+# 1. Separar X/y — IGUAL en regresión y clasificación
+X = data.drop(columns=['target', 'id'])
+y = data['target']
+
+# 2. Split
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42,
+    stratify=y   # <- CAMBIA: SOLO clasificación. Mantiene la misma proporción de
+                 #    clases en train/test. En regresión no existe (target continuo,
+                 #    no hay "clases" que estratificar).
+)
+
+# 3. Grupos de columnas — IGUAL en ambos casos
+numeric_cols = [...]
+ordinal_cols = [...]
+nominal_cols = [...]
+
+# 4. Sub-pipelines — IGUAL en ambos casos (la preparación no depende del modelo final)
+numeric_transformer = Pipeline([
+    ('imputer', SimpleImputer(strategy='median')),
+    ('scaler', StandardScaler())   # con KNN esto es AÚN MÁS crítico: usa distancias
+                                    # directas entre puntos, sin escalar una variable
+                                    # de rango grande domina toda la distancia
+])
+
+ordinal_transformer = Pipeline([
+    ('imputer', SimpleImputer(strategy='most_frequent')),
+    ('encoder', OrdinalEncoder(categories=[[...], [...]]))
+])
+
+nominal_transformer = Pipeline([
+    ('imputer', SimpleImputer(strategy='most_frequent')),
+    ('encoder', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
+])
+
+# 5. ColumnTransformer — IGUAL en ambos casos
+preprocessor = ColumnTransformer([
+    ('num', numeric_transformer, numeric_cols),
+    ('ord', ordinal_transformer, ordinal_cols),
+    ('nom', nominal_transformer, nominal_cols)
+])
+
+# 6. fit_transform en train — IGUAL en ambos casos
+X_train_prep = preprocessor.fit_transform(X_train)
+
+# --- CAMBIA: bloque que solo existe en clasificación, y solo si hay desbalance ---
+# from imblearn.over_sampling import SMOTE
+# X_train_prep, y_train = SMOTE(random_state=42).fit_resample(X_train_prep, y_train)
+# (NUNCA se aplica a test — el test debe reflejar la distribución real de clases)
+# ------------------------------------------------------------------------------
+
+# 7. transform sobre test — IGUAL en ambos casos
+X_test_prep = preprocessor.transform(X_test)
+
+X_test_prep_df = pd.DataFrame(X_test_prep, columns=preprocessor.get_feature_names_out())
+display(X_test_prep_df.head())
+```
+
+Resumen: solo 2 cosas cambian dentro del código del pipeline (`stratify=y` en el split, y el bloque opcional de resampling después de `fit_transform`) — todo lo demás, letra por letra, es igual.
+
 ---
 
 ## Si el caso es clasificación en vez de regresión (ej. regresión logística o KNN)
